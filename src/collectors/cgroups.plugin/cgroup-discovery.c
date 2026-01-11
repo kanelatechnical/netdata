@@ -823,7 +823,7 @@ static inline void discovery_share_cgroups_with_ebpf() {
     }
     sem_wait(shm_mutex_cgroup_ebpf);
 
-    for (cg = cgroup_root, count = 0; cg; cg = cg->next, count++) {
+    for (cg = cgroup_root, count = 0; cg && count < cgroup_root_max; cg = cg->next, count++) {
         netdata_ebpf_cgroup_shm_body_t *ptr = &shm_cgroup_ebpf.body[count];
         char *prefix = (is_cgroup_systemd_service(cg)) ? services_chart_id_prefix : cgroup_chart_id_prefix;
         snprintfz(ptr->name, CGROUP_EBPF_NAME_SHARED_LENGTH - 1, "%s%s", prefix, cg->chart_id);
@@ -841,6 +841,13 @@ static inline void discovery_share_cgroups_with_ebpf() {
         }
 
         netdata_log_debug(D_CGROUP, "cgroup shared: NAME=%s, ENABLED=%d", ptr->name, ptr->enabled);
+    }
+
+    if (unlikely(cg != NULL)) {
+        nd_log_limit_static_global_var(erl, 3600, 0);
+        nd_log_limit(&erl, NDLS_COLLECTORS, NDLP_WARNING,
+                     "CGROUP: shared memory buffer full (%d cgroups). Some cgroups were not shared with eBPF.",
+                     cgroup_root_max);
     }
 
     shm_cgroup_ebpf.header->cgroup_root_count = count;
@@ -1048,6 +1055,12 @@ static void netdata_cgroup_ebpf_set_values(size_t length)
 
 static void netdata_cgroup_ebpf_initialize_shm()
 {
+    // Unlink any existing shared memory and semaphore to start fresh.
+    // This prevents truncating memory that another process might be using.
+    // Existing mappings in other processes remain valid until they unmap.
+    (void) shm_unlink(NETDATA_SHARED_MEMORY_EBPF_CGROUP_NAME);
+    (void) sem_unlink(NETDATA_NAMED_SEMAPHORE_EBPF_CGROUP_NAME);
+
     shm_fd_cgroup_ebpf = shm_open(NETDATA_SHARED_MEMORY_EBPF_CGROUP_NAME, O_CREAT | O_RDWR, 0660);
     if (shm_fd_cgroup_ebpf < 0) {
         collector_error("Cannot initialize shared memory used by cgroup and eBPF, integration won't happen.");
@@ -1086,13 +1099,14 @@ static void netdata_cgroup_ebpf_initialize_shm()
     end_init_shm:
     close(shm_fd_cgroup_ebpf);
     shm_fd_cgroup_ebpf = -1;
-    shm_unlink(NETDATA_SHARED_MEMORY_EBPF_CGROUP_NAME);
+    (void) shm_unlink(NETDATA_SHARED_MEMORY_EBPF_CGROUP_NAME);
 }
 
 static void cgroup_cleanup_ebpf_integration()
 {
     if (shm_mutex_cgroup_ebpf != SEM_FAILED) {
         sem_close(shm_mutex_cgroup_ebpf);
+        (void) sem_unlink(NETDATA_NAMED_SEMAPHORE_EBPF_CGROUP_NAME);
     }
 
     if (shm_cgroup_ebpf.header) {
@@ -1103,6 +1117,7 @@ static void cgroup_cleanup_ebpf_integration()
     if (shm_fd_cgroup_ebpf > 0) {
         close(shm_fd_cgroup_ebpf);
     }
+    (void) shm_unlink(NETDATA_SHARED_MEMORY_EBPF_CGROUP_NAME);
 }
 
 // ----------------------------------------------------------------------------

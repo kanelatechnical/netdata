@@ -32,7 +32,7 @@ func newGlobalTagsCollector(snmpClient gosnmp.Handler, missingOIDs map[string]bo
 }
 
 // Collect gathers all global tags from the profile
-func (gc *globalTagsCollector) Collect(prof *ddsnmp.Profile) (map[string]string, error) {
+func (gc *globalTagsCollector) collect(prof *ddsnmp.Profile) (map[string]string, error) {
 	if len(prof.Definition.MetricTags) == 0 && len(prof.Definition.StaticTags) == 0 {
 		return nil, nil
 	}
@@ -48,7 +48,7 @@ func (gc *globalTagsCollector) Collect(prof *ddsnmp.Profile) (map[string]string,
 	return tags, nil
 }
 
-func (gc *globalTagsCollector) processStaticTags(staticTags []string, globalTags map[string]string) {
+func (gc *globalTagsCollector) processStaticTags(staticTags []ddprofiledefinition.StaticMetricTagConfig, globalTags map[string]string) {
 	ta := tagAdder{tags: globalTags}
 	ta.addTags(parseStaticTags(staticTags))
 }

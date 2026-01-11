@@ -745,6 +745,47 @@ install_netdata_service() {
   return 1
 }
 
+install_netdata_tmpfiles() {
+  if [ "${UID}" -eq 0 ]; then
+    run mkdir -p /usr/lib/tmpfiles.d || return 1
+    run install -m 0644 -p "${NETDATA_PREFIX}/usr/lib/netdata/system/systemd/tmpfiles/netdata.conf" /usr/lib/tmpfiles.d/netdata.conf || return 1
+    return 0
+  else
+    return 1
+  fi
+}
+
+install_netdata_dirs() {
+  _DIRS_INSTALLED=0
+  if install_netdata_tmpfiles && command -v systemd-tmpfiles >/dev/null 2>&1 ; then
+    systemd-tmpfiles --create /usr/lib/tmpfiles.d/netdata.conf && _DIRS_INSTALLED=1
+  fi
+
+  if [ "${_DIRS_INSTALLED}" -eq 0 ]; then
+    for x in "${NETDATA_LIB_DIR}" "${NETDATA_CACHE_DIR}" "${NETDATA_LOG_DIR}"; do
+      if [ ! -d "${x}" ]; then
+        echo >&2 "Creating directory '${x}'"
+        if ! run mkdir -p "${x}"; then
+          warning "Failed to create ${x}, it must be created by hand or the Netdata Agent will not be able to be started."
+        fi
+      fi
+
+      run chown -R "${NETDATA_USER}:${NETDATA_GROUP}" "${x}"
+    done
+
+    run chmod 755 "${NETDATA_LOG_DIR}"
+
+    if [ ! -d "${NETDATA_CLAIMING_DIR}" ]; then
+      echo >&2 "Creating directory '${NETDATA_CLAIMING_DIR}'"
+      if ! run mkdir -p "${NETDATA_CLAIMING_DIR}"; then
+        warning "failed to create ${NETDATA_CLAIMING_DIR}, it will need to be created manually."
+      fi
+    fi
+    run chown -R "${NETDATA_USER}:${NETDATA_GROUP}" "${NETDATA_CLAIMING_DIR}"
+    run chmod 770 "${NETDATA_CLAIMING_DIR}"
+  fi
+}
+
 # -----------------------------------------------------------------------------
 # stop netdata
 
@@ -1034,6 +1075,33 @@ create_netdata_conf() {
 EOF
   fi
 
+}
+
+# -----------------------------------------------------------------------------
+# user handling functions
+
+create_netdata_accounts() {
+  NETDATA_WANTED_GROUPS="docker ceph I2C"
+
+  if [ -d "/etc/pve" ]; then
+    NETDATA_WANTED_GROUPS="${NETDATA_WANTED_GROUPS} www-data"
+  fi
+  if [ -e "/dev/nvidiactl" ]; then
+    NETDATA_WANTED_GROUPS="${NETDATA_WANTED_GROUPS} video"
+  fi
+
+  if command -v systemd-sysusers >/dev/null 2>&1; then
+    install -m 644 -o root -g root "${NETDATA_PREFIX}/usr/lib/netdata/system/systemd/sysusers/netdata.conf" /usr/lib/sysusers.d/netdata.conf
+    systemd-sysusers /usr/lib/sysusers.d/netdata.conf
+  else
+    portable_add_group netdata || :
+    portable_add_user netdata "${NETDATA_PREFIX}/var/lib/netdata" || :
+  fi
+
+  for g in ${NETDATA_WANTED_GROUPS}; do
+    # shellcheck disable=SC2086
+    portable_add_user_to_group ${g} netdata && NETDATA_ADDED_TO_GROUPS="${NETDATA_ADDED_TO_GROUPS:-} ${g}"
+  done
 }
 
 portable_add_user() {

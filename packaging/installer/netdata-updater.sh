@@ -22,7 +22,7 @@
 #  - TMPDIR (set to a usable temporary directory)
 #  - NETDATA_NIGHTLIES_BASEURL (set the base url for downloading the dist tarball)
 
-# Next unused error code: U001D
+# Next unused error code: U001F
 
 set -e
 
@@ -30,6 +30,8 @@ PACKAGES_SCRIPT="https://raw.githubusercontent.com/netdata/netdata/master/packag
 
 NETDATA_STABLE_BASE_URL="${NETDATA_BASE_URL:-https://github.com/netdata/netdata/releases}"
 NETDATA_NIGHTLY_BASE_URL="${NETDATA_BASE_URL:-https://github.com/netdata/netdata-nightlies/releases}"
+NETDATA_STABLE_REPO_URL="${NETDATA_BASE_URL:-https://repository.netdata.cloud/repos/stable}"
+NETDATA_NIGHTLY_REPO_URL="${NETDATA_BASE_URL:-https://repository.netdata.cloud/repos/edge}"
 NETDATA_DEFAULT_ACCEPT_MAJOR_VERSIONS="1 2"
 
 # Following variables are intended to be overridden by the updater config file.
@@ -295,6 +297,43 @@ install_build_dependencies() {
     if ! "${bash}" "./install-required-packages.sh" ${opts} netdata >&3 2>&3; then
       error "Installing build dependencies failed. The update should still work, but you might be missing some features."
     fi
+  fi
+}
+
+# Certain versions of this script had a bug that could cause /dev/null
+# to be removed mistakenly under some circumstances.
+#
+# This function attempts to detect and fix the resulting situation.
+#
+# Fix limited to Linux for the moment because apparently trying to
+# proactively fix systems that we aren’t certain have been affected is
+# too invasive of a change for some people...
+dev_null_fix() {
+  if [ -f /dev/null ] || [ ! -e /dev/null ]; then
+    case "$(uname -s)" in
+      Linux)
+        rm -f /dev/.null
+        mknod -m 666 /dev/.null c 1 3
+        # Some distros use ownership other than root:root for /dev/null,
+        # but it almost always matches the ownership of /dev/full,
+        # so if possible copy the onwership from there.
+        if [ -c /dev/full ]; then
+            chown --reference=/dev/full /dev/.null
+        fi
+        mv -f /dev/.null /dev/null
+        # If the system seems to be using SELinux, apply the correct
+        # security context to the new /dev/null.
+        #
+        # This check doesn’t use /dev/null as trying to access it
+        # without the right security context being set may fail.
+        dummy_null="$(mktemp)"
+        if command -v restorecon >"${dummy_null}" 2>&1; then
+            restorecon /dev/null
+        fi
+        rm -f "${dummy_null}" || true # Cleanup from the above check
+        ;;
+      *) ;;
+    esac
   fi
 }
 
@@ -572,7 +611,7 @@ _safe_download() {
 
     if "${curl}" -fsSL --connect-timeout 10 --retry 3 "${url}" > "${dest}"; then
       succeeded=1
-    else
+    elif [ "${dest}" != "/dev/null" ]; then
       rm -f "${dest}"
     fi
   fi
@@ -583,7 +622,7 @@ _safe_download() {
 
       if wget -T 15 -O - "${url}" > "${dest}"; then
         succeeded=1
-      else
+      elif [ "${dest}" != "/dev/null" ]; then
         rm -f "${dest}"
       fi
     fi
@@ -602,8 +641,10 @@ download() {
   url="${1}"
   dest="${2}"
 
+  set +e
   _safe_download "${url}" "${dest}"
   ret=$?
+  set -e
 
   if [ ${ret} -eq 0 ]; then
     return 0
@@ -734,7 +775,7 @@ parse_version() {
   if [ "${r}" = "latest" ]; then
     # If we get ‘latest’ as a version, return the largest possible
     # version value.
-    printf "99999999999999"
+    printf "999999999999999"
     return 0
   elif echo "${r}" | grep -q '^v.*'; then
     # shellcheck disable=SC2001
@@ -755,15 +796,19 @@ parse_version() {
 
   rm -f "${tmpfile}"
 
-  printf "%03d%03d%03d%05d" "${maj}" "${min}" "${patch}" "${b}"
+  printf "%04d%03d%03d%05d" "${maj}" "${min}" "${patch}" "${b}"
 }
 
-get_latest_version() {
-  if [ "${RELEASE_CHANNEL}" = "stable" ]; then
-    get_netdata_latest_tag "${NETDATA_STABLE_BASE_URL}"
-  else
-    get_netdata_latest_tag "${NETDATA_NIGHTLY_BASE_URL}"
+get_latest_tag() {
+  if [ -z "${_latest_tag}" ]; then
+    if [ "${RELEASE_CHANNEL}" = "stable" ]; then
+        _latest_tag="$(get_netdata_latest_tag "${NETDATA_STABLE_BASE_URL}")"
+    else
+        _latest_tag="$(get_netdata_latest_tag "${NETDATA_NIGHTLY_BASE_URL}")"
+    fi
   fi
+
+  echo "${_latest_tag}"
 }
 
 validate_environment_file() {
@@ -774,45 +819,49 @@ validate_environment_file() {
   fi
 }
 
-update_available() {
-  if [ "$NETDATA_FORCE_UPDATE" = "1" ]; then
-     info "Force update requested"
-     return 0
-  fi
-
+get_current_version() {
   basepath="$(dirname "$(dirname "$(dirname "${NETDATA_LIB_DIR}")")")"
   searchpath="${basepath}/bin:${basepath}/sbin:${basepath}/usr/bin:${basepath}/usr/sbin:${PATH}"
   searchpath="${basepath}/netdata/bin:${basepath}/netdata/sbin:${basepath}/netdata/usr/bin:${basepath}/netdata/usr/sbin:${searchpath}"
   ndbinary="$(PATH="${searchpath}" command -v netdata 2>/dev/null)"
 
   if [ -z "${ndbinary}" ]; then
-    current_version=0
+    _current_version=0
   else
-    current_version="$(parse_version "$(${ndbinary} -v | cut -f 2 -d ' ')")"
+    _current_version="$(parse_version "$(${ndbinary} -V | cut -f 2 -d ' ')")"
   fi
 
-  latest_tag="$(get_latest_version)"
-  latest_version="$(parse_version "${latest_tag}")"
-  path_version="$(echo "${latest_tag}" | cut -f 1 -d "-")"
+  echo "${_current_version:-0}"
+}
 
-  # If we can't get the current version for some reason assume `0`
-  current_version="${current_version:-0}"
+get_latest_version() {
+  parse_version "$(get_latest_tag)"
+}
 
-  # If we can't get the latest version for some reason assume `0`
-  latest_version="${latest_version:-0}"
+update_available() {
+  if [ "$NETDATA_FORCE_UPDATE" = "1" ]; then
+     info "Force update requested"
+     return 0
+  fi
+
+  current_version="$(get_current_version)"
+  latest_version="$(get_latest_version)"
 
   info "Current Version: ${current_version}"
   info "Latest Version: ${latest_version}"
 
-  if [ "${latest_version}" -gt 0 ] && [ "${current_version}" -gt 0 ] && [ "${current_version}" -ge "${latest_version}" ]; then
+  if [ -z "${latest_version}" ] || [ -z "${current_version}" ] ; then
+    info "Unable to compare versions for update check, assuming an update is required."
+    return 0
+  elif [ "${latest_version}" -gt 0 ] && [ "${current_version}" -gt 0 ] && [ "${current_version}" -ge "${latest_version}" ]; then
     info "Newest version (current=${current_version} >= latest=${latest_version}) is already installed"
     return 1
   else
     info "Update available"
 
     if [ "${current_version}" -ne 0 ] && [ "${latest_version}" -ne 0 ]; then
-      current_major="$(${ndbinary} -v | cut -f 2 -d ' ' | cut -f 1 -d '.' | tr -d 'v')"
-      latest_major="$(echo "${latest_tag}" | cut -f 1 -d '.' | tr -d 'v')"
+      current_major="$(echo "${current_version}" | head -c 4)"
+      latest_major="$(echo "${latest_version}" | head -c 4)"
 
       if [ "${current_major}" -ne "${latest_major}" ]; then
         update_safe=0
@@ -887,7 +936,7 @@ update_build() {
       tar -xf netdata-latest.tar.gz >&3 2>&3
       rm netdata-latest.tar.gz >&3 2>&3
       if [ -z "$path_version" ]; then
-        latest_tag="$(get_latest_version)"
+        latest_tag="$(get_latest_tag)"
         path_version="$(echo "${latest_tag}" | cut -f 1 -d "-")"
       fi
       cd "$(find . -maxdepth 1 -type d -name "netdata-${path_version}*" | head -n 1)" || fatal "Failed to switch to build directory" U0017
@@ -1003,7 +1052,8 @@ update_static() {
     cd "${PREVDIR}"
   fi
   [ -n "${logfile}" ] && rm "${logfile}" && logfile=
-  exit 0
+
+  return 0
 }
 
 get_new_binpkg_major() {
@@ -1029,8 +1079,9 @@ update_binpkg() {
   . "${os_release_file}"
 
   DISTRO="${ID}"
+  SYSVERSION="${VERSION_ID}"
 
-  supported_compat_names="debian ubuntu centos fedora opensuse ol amzn"
+  supported_compat_names="debian ubuntu centos centos-stream fedora opensuse ol amzn"
 
   if str_in_list "${DISTRO}" "${supported_compat_names}"; then
     DISTRO_COMPAT_NAME="${DISTRO}"
@@ -1039,7 +1090,7 @@ update_binpkg() {
       opensuse-leap|opensuse-tumbleweed)
         DISTRO_COMPAT_NAME="opensuse"
         ;;
-      cloudlinux|almalinux|centos-stream|rocky|rhel)
+      cloudlinux|almalinux|rocky|rhel)
         DISTRO_COMPAT_NAME="centos"
         ;;
       raspbian)
@@ -1074,8 +1125,11 @@ update_binpkg() {
       repo_update_opts="${interactive_opts}"
       pkg_installed_check="dpkg-query -s"
       INSTALL_TYPE="binpkg-deb"
+      if [ -n "${VERSION_CODENAME}" ]; then
+        repo_path="${DISTRO_COMPAT_NAME}/${VERSION_CODENAME}"
+      fi
       ;;
-    centos|fedora|ol|amzn)
+    centos|centos-stream|fedora|ol|amzn)
       if [ "${INTERACTIVE}" = "0" ]; then
         interactive_opts="-y"
       fi
@@ -1093,6 +1147,13 @@ update_binpkg() {
       repo_update_opts="${interactive_opts}"
       pkg_installed_check="rpm -q"
       INSTALL_TYPE="binpkg-rpm"
+      case "${DISTRO_COMPAT_NAME}" in
+        amzn) repo_path="amazonlinux/${SYSVERSION}/$(uname -m)" ;;
+        centos-stream) repo_path="el/c${SYSVERSION}s/$(uname -m)" ;;
+        fedora) repo_path="fedora/${SYSVERSION}/$(uname -m)" ;;
+        ol) repo_path="ol/${SYSVERSION}/$(uname -m)" ;;
+        *) repo_path="el/$(echo "${SYSVERSION}" | cut -f 1 -d '.')/$(uname -m)" ;;
+      esac
       ;;
     opensuse)
       if [ "${INTERACTIVE}" = "0" ]; then
@@ -1108,6 +1169,7 @@ update_binpkg() {
       repo_update_opts=""
       pkg_installed_check="rpm -q"
       INSTALL_TYPE="binpkg-rpm"
+      repo_path="${DISTRO_COMPAT_NAME}/${SYSVERSION}/$(uname -m)"
       ;;
     *)
       warning "We do not provide native packages for ${DISTRO}."
@@ -1115,26 +1177,74 @@ update_binpkg() {
       ;;
   esac
 
+  initial_version="$(get_current_version)"
+
   if [ -n "${repo_subcmd}" ]; then
     # shellcheck disable=SC2086
     env ${env} ${pm_cmd} ${repo_subcmd} ${repo_update_opts} >&3 2>&3 || fatal "Failed to update repository metadata." U000C
   fi
 
-  for repopkg in netdata-repo netdata-repo-edge; do
-    if ${pkg_installed_check} ${repopkg} > /dev/null 2>&1; then
-      # shellcheck disable=SC2086
-      env ${env} ${pm_cmd} ${upgrade_subcmd} ${pkg_install_opts} ${repopkg} >&3 2>&3 || fatal "Failed to update Netdata repository config." U000D
-      # shellcheck disable=SC2086
-      if [ -n "${repo_subcmd}" ]; then
-        env ${env} ${pm_cmd} ${repo_subcmd} ${repo_update_opts} >&3 2>&3 || fatal "Failed to update repository metadata." U000E
-      fi
-    fi
-  done
+  if ${pkg_installed_check} netdata-repo > /dev/null 2>&1; then
+    RELEASE_CHANNEL="stable"
+    repopkg="netdata-repo"
+  elif ${pkg_installed_check} netdata-repo-edge > /dev/null 2>&1; then
+    RELEASE_CHANNEL="nightly"
+    repopkg="netdata-repo-edge"
+  elif echo "${initial_version}" | grep -Eq -- '^[0-9]*[1-9][0-9]*0{5}$'; then # All five final digits are zero and at least one preceeding digit is non-zero.
+    RELEASE_CHANNEL="stable"
+  elif echo "${initial_version}" | grep -Eq -- '^[0-9]*[1-9][0-9]{0,4}$'; then # At least one of the final five digits is non-zero.
+    RELEASE_CHANNEL="nightly"
+  else
+    RELEASE_CHANNEL="none"
+    warning "Unable to determine which release channel is being used on this system, cannot check if packages are still being published."
+  fi
 
-  current_major="$(netdata -v | cut -f 2 -d ' ' | cut -f 1 -d '.' | tr -d 'v')"
+  if [ -n "${repo_path}" ]; then
+    case "${RELEASE_CHANNEL}" in
+      stable) check_url="${NETDATA_STABLE_REPO_URL}/${repo_path}/.currently.published" ;;
+      nightly) check_url="${NETDATA_NIGHTLY_REPO_URL}/${repo_path}/.currently.published" ;;
+    esac
+  fi
+
+  if [ -n "${check_url}" ]; then
+    info "Checking if native packages are still being published for this platform."
+
+    set +e
+    _safe_download "${check_url}" /dev/null
+    ret=$?
+    set -e
+
+    case "${ret}" in
+      0) info "Native packages are still being published for this platform." ;;
+      1)
+        error ""
+        error "NETDATA CANNOT BE UPDATED ON THIS SYSTEM!"
+        error ""
+        error "Native packages are no longer being published for this platform."
+        error ""
+        error "To update to the latest version of Netdata, you will need to switch to a different install type."
+        error "For details on how to do so, see https://learn.netdata.cloud/docs/netdata-agent/installation/linux/switch-install-types-and-release-channels"
+        error ""
+        fatal "Unable to update due to native packages no longer being published for this platform" U001E
+        ;;
+      255) warning "Unable to check whether native packages are being published, wget or curl is required." ;;
+    esac
+  fi
+
+  if [ -n "${repopkg}" ]; then
+    # shellcheck disable=SC2086
+    env ${env} ${pm_cmd} ${upgrade_subcmd} ${pkg_install_opts} ${repopkg} >&3 2>&3 || fatal "Failed to update Netdata repository config." U000D
+    # shellcheck disable=SC2086
+    if [ -n "${repo_subcmd}" ]; then
+      env ${env} ${pm_cmd} ${repo_subcmd} ${repo_update_opts} >&3 2>&3 || fatal "Failed to update repository metadata." U000E
+    fi
+  fi
+
+  current_major="$(get_current_version | head -c 4 | awk '{ print $1 + 0 }')"
   latest_major="$(get_new_binpkg_major)"
 
-  if [ -n "${latest_major}" ] && [ "${latest_major}" -ne "${current_major}" ]; then
+  # current_major == 0 means we could not determine the installed version
+  if [ -n "${latest_major}" ] && [ "${current_major}" -ne 0 ] && [ "${latest_major}" -ne "${current_major}" ]; then
     update_safe=0
 
     for v in ${NETDATA_ACCEPT_MAJOR_VERSIONS}; do
@@ -1162,6 +1272,23 @@ update_binpkg() {
           env ${env} ${mark_auto_cmd} netdata-plugin-systemd-journal >&3 2>&3
         fi
       fi
+    fi
+  fi
+
+  current_version="$(get_current_version)"
+  latest_version="$(get_latest_version)"
+
+  if [ "${RELEASE_CHANNEL}" != "none" ] && [ "${current_version}" -ne 0 ] && [ "${latest_version}" -ne 0 ]; then
+    if [ "${current_version}" -lt "${latest_version}" ] && [ "${initial_version}" -eq "${current_version}" ]; then
+      error ""
+      error "NETDATA WAS NOT UPDATED!"
+      error ""
+      error "A newer version of Netdata is available, but the system package manager does not appear to have updated to that version."
+      error ""
+      error "Most likely, your system is not up to date, and you have it configured in a way that prevents updating one or more of Netdata's dependencies."
+      error "Please try updating your system manually and then re-running the Netdata updater before reporting an issue with the update process."
+      error ""
+      fatal "Package manager did not fully update Netdata despite not reporting a failure." U001D
     fi
   fi
 
@@ -1307,6 +1434,8 @@ if echo "$INSTALL_TYPE" | grep -qv ^binpkg && [ "${INSTALL_UID}" != "$(id -u)" ]
 fi
 
 self_update
+
+dev_null_fix
 
 # shellcheck disable=SC2153
 case "${INSTALL_TYPE}" in

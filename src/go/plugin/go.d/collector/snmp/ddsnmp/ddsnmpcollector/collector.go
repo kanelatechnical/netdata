@@ -19,10 +19,11 @@ import (
 )
 
 type Config struct {
-	SnmpClient  gosnmp.Handler
-	Profiles    []*ddsnmp.Profile
-	Log         *logger.Logger
-	SysObjectID string
+	SnmpClient      gosnmp.Handler
+	Profiles        []*ddsnmp.Profile
+	Log             *logger.Logger
+	SysObjectID     string
+	DisableBulkWalk bool
 }
 
 func New(cfg Config) *Collector {
@@ -42,7 +43,7 @@ func New(cfg Config) *Collector {
 	coll.globalTagsCollector = newGlobalTagsCollector(cfg.SnmpClient, coll.missingOIDs, coll.log)
 	coll.deviceMetadataCollector = newDeviceMetadataCollector(cfg.SnmpClient, coll.missingOIDs, coll.log, cfg.SysObjectID)
 	coll.scalarCollector = newScalarCollector(cfg.SnmpClient, coll.missingOIDs, coll.log)
-	coll.tableCollector = newTableCollector(cfg.SnmpClient, coll.missingOIDs, coll.tableCache, coll.log)
+	coll.tableCollector = newTableCollector(cfg.SnmpClient, coll.missingOIDs, coll.tableCache, coll.log, cfg.DisableBulkWalk)
 	coll.vmetricsCollector = newVirtualMetricsCollector(coll.log)
 
 	return coll
@@ -62,10 +63,12 @@ type (
 		vmetricsCollector       *vmetricsCollector
 	}
 	profileState struct {
-		profile        *ddsnmp.Profile
-		initialized    bool
-		globalTags     map[string]string
-		deviceMetadata map[string]ddsnmp.MetaTag
+		profile     *ddsnmp.Profile
+		initialized bool
+		cache       struct {
+			globalTags     map[string]string
+			deviceMetadata map[string]ddsnmp.MetaTag
+		}
 	}
 )
 
@@ -73,7 +76,7 @@ func (c *Collector) CollectDeviceMetadata() (map[string]ddsnmp.MetaTag, error) {
 	meta := make(map[string]ddsnmp.MetaTag)
 
 	for _, prof := range c.profiles {
-		profDeviceMeta, err := c.deviceMetadataCollector.Collect(prof.profile)
+		profDeviceMeta, err := c.deviceMetadataCollector.collect(prof.profile)
 		if err != nil {
 			return nil, err
 		}
@@ -90,7 +93,8 @@ func (c *Collector) Collect() ([]*ddsnmp.ProfileMetrics, error) {
 	var metrics []*ddsnmp.ProfileMetrics
 	var errs []error
 
-	if expired := c.tableCache.clearExpired(); len(expired) > 0 {
+	expired := c.tableCache.clearExpired()
+	if len(expired) > 0 {
 		c.log.Debugf("Cleared %d expired table cache entries", len(expired))
 	}
 
@@ -105,13 +109,16 @@ func (c *Collector) Collect() ([]*ddsnmp.ProfileMetrics, error) {
 
 		metrics = append(metrics, pm)
 
-		if vmetrics := c.vmetricsCollector.Collect(prof.profile.Definition, pm.Metrics); len(vmetrics) > 0 {
+		now := time.Now()
+		if vmetrics := c.vmetricsCollector.collect(prof.profile.Definition, pm.Metrics); len(vmetrics) > 0 {
 			for i := range vmetrics {
 				vmetrics[i].Profile = pm
 			}
 
 			pm.Metrics = slices.DeleteFunc(pm.Metrics, func(m ddsnmp.Metric) bool { return strings.HasPrefix(m.Name, "_") })
 			pm.Metrics = append(pm.Metrics, vmetrics...)
+			pm.Stats.Metrics.Virtual += int64(len(vmetrics))
+			pm.Stats.Timing.VirtualMetrics = time.Since(now)
 		}
 	}
 
@@ -141,42 +148,47 @@ func (c *Collector) SetSNMPClient(snmpClient gosnmp.Handler) {
 }
 
 func (c *Collector) collectProfile(ps *profileState) (*ddsnmp.ProfileMetrics, error) {
+	pm := &ddsnmp.ProfileMetrics{
+		Source: ps.profile.SourceFile,
+	}
+
 	if !ps.initialized {
-		globalTag, err := c.globalTagsCollector.Collect(ps.profile)
+		globalTag, err := c.globalTagsCollector.collect(ps.profile)
 		if err != nil {
 			return nil, fmt.Errorf("failed to collect global tags: %w", err)
 		}
+		ps.cache.globalTags = globalTag
 
-		deviceMeta, err := c.deviceMetadataCollector.Collect(ps.profile)
+		deviceMeta, err := c.deviceMetadataCollector.collect(ps.profile)
 		if err != nil {
 			return nil, fmt.Errorf("failed to collect device metadata: %w", err)
 		}
+		ps.cache.deviceMetadata = deviceMeta
 
-		ps.globalTags = globalTag
-		ps.deviceMetadata = deviceMeta
 		ps.initialized = true
 	}
 
-	var metrics []ddsnmp.Metric
+	pm.Tags = maps.Clone(ps.cache.globalTags)
+	pm.DeviceMetadata = maps.Clone(ps.cache.deviceMetadata)
 
-	scalarMetrics, err := c.scalarCollector.Collect(ps.profile)
+	now := time.Now()
+	scalarMetrics, err := c.scalarCollector.collect(ps.profile, &pm.Stats)
 	if err != nil {
 		return nil, err
 	}
-	metrics = append(metrics, scalarMetrics...)
+	pm.Metrics = append(pm.Metrics, scalarMetrics...)
+	pm.Stats.Timing.Scalar = time.Since(now)
+	pm.Stats.Metrics.Scalar += int64(len(scalarMetrics))
 
-	tableMetrics, err := c.tableCollector.Collect(ps.profile)
+	now = time.Now()
+	tableMetrics, err := c.tableCollector.collect(ps.profile, &pm.Stats)
 	if err != nil {
 		return nil, err
 	}
-	metrics = append(metrics, tableMetrics...)
+	pm.Metrics = append(pm.Metrics, tableMetrics...)
+	pm.Stats.Timing.Table = time.Since(now)
+	pm.Stats.Metrics.Table += int64(len(tableMetrics))
 
-	pm := &ddsnmp.ProfileMetrics{
-		Source:         ps.profile.SourceFile,
-		DeviceMetadata: maps.Clone(ps.deviceMetadata),
-		Tags:           maps.Clone(ps.globalTags),
-		Metrics:        metrics,
-	}
 	for i := range pm.Metrics {
 		pm.Metrics[i].Profile = pm
 	}

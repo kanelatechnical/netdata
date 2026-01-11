@@ -17,6 +17,7 @@ project(netdata
         HOMEPAGE_URL "https://www.netdata.cloud"
         LANGUAGES C CXX)
 include(CMakeDependentOption)
+include(CMakePushCheckState)
 include(NetdataUtil)
 netdata_fixup_system_processor()
 
@@ -255,6 +256,7 @@ if(ENABLE_JEMALLOC)
     pkg_check_modules(JEMALLOC QUIET jemalloc)
     if(JEMALLOC_FOUND)
         # Check if jemalloc has arena API
+        cmake_push_check_state()
         set(CMAKE_REQUIRED_INCLUDES ${JEMALLOC_INCLUDE_DIRS})
         set(CMAKE_REQUIRED_LIBRARIES ${JEMALLOC_LIBRARIES})
         check_c_source_compiles("
@@ -266,6 +268,7 @@ if(ENABLE_JEMALLOC)
                 return 0;
             }
         " HAVE_JEMALLOC_ARENA_API)
+        cmake_pop_check_state()
 
         if(HAVE_JEMALLOC_ARENA_API)
             set(ENABLE_JEMALLOC ON CACHE BOOL "Enable jemalloc allocator" FORCE)
@@ -503,6 +506,7 @@ int main(void) {
 }
 " HAVE_TM_GMTOFF)
 
+cmake_push_check_state()
 set(CMAKE_REQUIRED_LIBRARIES pthread)
 check_c_source_compiles("
 #define _GNU_SOURCE
@@ -513,6 +517,7 @@ int main() {
         return pthread_getname_np(thread, name, sizeof(name));
 }
 " HAVE_PTHREAD_GETNAME_NP)
+cmake_pop_check_state()
 
 check_c_source_compiles("
 #include <stdio.h>
@@ -1458,6 +1463,7 @@ if(ENABLE_ML)
         if(NOT ENABLE_MIMALLOC)
                 list(APPEND ML_FILES src/ml/ml_memory.cc)
         endif()
+        set_source_files_properties(${ML_FILES} PROPERTIES COMPILE_OPTIONS "-Wno-attributes")
 else()
         set(ML_FILES
                 src/ml/ml_public.h
@@ -1931,12 +1937,13 @@ set(WINDOWS_PLUGIN_FILES
         src/collectors/windows.plugin/GetPowerSupply.c
         src/collectors/windows.plugin/GetServicesStatus.c
         src/collectors/windows.plugin/GetSensors.c
+        src/collectors/windows.plugin/GetHardwareInfo.c
+        src/collectors/windows.plugin/MonitorSQL.c
         src/collectors/windows.plugin/perflib-adcs.c
         src/collectors/windows.plugin/perflib-adfs.c
         src/collectors/windows.plugin/perflib-rrd.c
         src/collectors/windows.plugin/perflib-rrd.h
         src/collectors/windows.plugin/perflib-ad.c
-        src/collectors/windows.plugin/perflib-mssql.c
         src/collectors/windows.plugin/perflib-mssql-queries.h
         src/collectors/windows.plugin/perflib-storage.c
         src/collectors/windows.plugin/perflib-processor.c
@@ -1944,6 +1951,7 @@ set(WINDOWS_PLUGIN_FILES
         src/collectors/windows.plugin/perflib-objects.c
         src/collectors/windows.plugin/perflib-network.c
         src/collectors/windows.plugin/perflib-netframework.c
+        src/collectors/windows.plugin/perflib-mssql.c
         src/collectors/windows.plugin/perflib-memory.c
         src/collectors/windows.plugin/perflib-processes.c
         src/collectors/windows.plugin/perflib-web-service.c
@@ -1951,6 +1959,11 @@ set(WINDOWS_PLUGIN_FILES
         src/collectors/windows.plugin/perflib-exchange.c
         src/collectors/windows.plugin/perflib-numa.c
         src/collectors/windows.plugin/perflib-asp.c
+)
+
+set(WINDOWS_PLUGIN_DRIVER
+        src/collectors/windows.plugin/netdata_win_driver.c
+        src/collectors/windows.plugin/netdata_win_driver.h
 )
 
 set(PROC_PLUGIN_FILES
@@ -2132,7 +2145,7 @@ set(ACLK_FILES
         src/aclk/schema-wrappers/agent_cmds.cc
         src/aclk/schema-wrappers/agent_cmds.h
 )
-
+set_source_files_properties(src/aclk/schema-wrappers/proto_2_json.cc PROPERTIES COMPILE_OPTIONS "-Wno-unused-result")
 
 set(MONGODB_EXPORTING_FILES
         src/exporting/mongodb/mongodb.c
@@ -2179,6 +2192,7 @@ set_source_files_properties(JudyLTables.c PROPERTIES COMPILE_OPTIONS "-I${CMAKE_
 #
 
 add_library(libnetdata STATIC ${LIBNETDATA_FILES})
+set_source_files_properties(src/libnetdata/gorilla/gorilla.cc PROPERTIES COMPILE_OPTIONS "-Wno-attributes")
 
 target_include_directories(libnetdata BEFORE PUBLIC ${CONFIG_H_DIR} ${CMAKE_SOURCE_DIR}/src)
 
@@ -2715,6 +2729,7 @@ if(NEED_NDSUDO)
     install(TARGETS ndsudo
             COMPONENT netdata
             DESTINATION usr/libexec/netdata/plugins.d)
+    set_source_files_properties(${NDSUDO_FILES} PROPERTIES COMPILE_OPTIONS "-Wno-unused-result")
 endif()
 
 if(ENABLE_PLUGIN_CGROUP_NETWORK)
@@ -3017,6 +3032,35 @@ if(OS_WINDOWS)
         add_executable(NetdataClaim ${CLAIM_WINDOWS_FILES} ${NETDATA_CLAIM_RES_FILES})
         target_link_libraries(NetdataClaim shell32 gdi32 msftedit)
         target_compile_options(NetdataClaim PUBLIC -mwindows)
+
+        set(NETDATA_DRIVER_FILE "${CMAKE_BINARY_DIR}/netdata_driver.sys")
+
+        add_library(netdata_driver SHARED ${WINDOWS_PLUGIN_DRIVER})
+        set_target_properties(netdata_driver PROPERTIES LIBRARY_OUTPUT_NAME "netdata_driver")
+        set_target_properties(netdata_driver PROPERTIES PREFIX "")
+        set_target_properties(netdata_driver PROPERTIES SUFFIX ".sys")
+        target_include_directories(netdata_driver PRIVATE BEFORE "/mingw64/include/ddk" "${CMAKE_SOURCE_DIR}/src/collectors/windows.plugin")
+        target_compile_options(netdata_driver PRIVATE
+                -Wall
+                -Wextra
+                -Werror
+                -ffreestanding
+                -fno-exceptions
+                -fno-stack-protector
+                -fshort-wchar
+                -mno-red-zone
+        )
+        target_link_options(netdata_driver PRIVATE
+                -Wl,--entry,DriverEntry@8
+                -nostdlib
+                -Wl,--subsystem,native
+                -Wl,--image-base,0x10000
+        )
+        target_link_libraries(netdata_driver kernel32 ntoskrnl)
+
+        install(FILES "${NETDATA_DRIVER_FILE}"
+                COMPONENT netdata_win_driver
+                DESTINATION "${BINDIR}")
 endif()
 
 target_compile_options(netdata PRIVATE
@@ -3159,6 +3203,7 @@ endif()
 #
 
 if(ENABLE_PLUGIN_IBM)
+    pkg_check_modules(ODBC REQUIRED odbc)
     include(NetdataIBMPlugin)
     add_ibm_plugin_target()
 
@@ -3276,6 +3321,7 @@ set(libconfigdir_POST "${LIBCONFIG_DIR}")
 set(cachedir_POST "${CACHE_DIR}")
 set(varlibdir_POST "${VARLIB_DIR}")
 set(registrydir_POST "${VARLIB_DIR}/registry")
+set(logdir_POST "${LOG_DIR}")
 set(netdata_user_POST "${NETDATA_USER}")
 set(netdata_group_POST "${NETDATA_USER}")
 
@@ -3438,12 +3484,31 @@ install(FILES
         COMPONENT netdata
         DESTINATION usr/lib/netdata/system/systemd)
 
+configure_file(system/systemd/sysusers.conf.in system/systemd/sysusers/netdata.conf @ONLY)
+install(FILES
+        ${CMAKE_BINARY_DIR}/system/systemd/sysusers/netdata.conf
+        COMPONENT netdata
+        DESTINATION usr/lib/netdata/system/systemd/sysusers)
+
+configure_file(system/systemd/tmpfiles.conf.in system/systemd/tmpfiles/netdata.conf @ONLY)
+install(FILES
+        ${CMAKE_BINARY_DIR}/system/systemd/tmpfiles/netdata.conf
+        COMPONENT netdata
+        DESTINATION usr/lib/netdata/system/systemd/tmpfiles)
 
 if(BUILD_FOR_PACKAGING)
         install(FILES
                 ${CMAKE_BINARY_DIR}/system/systemd/netdata.service
                 COMPONENT netdata
                 DESTINATION lib/systemd/system)
+        install(FILES
+                ${CMAKE_BINARY_DIR}/system/systemd/sysusers/netdata.conf
+                COMPONENT user
+                DESTINATION usr/lib/sysusers.d)
+        install(FILES
+                ${CMAKE_BINARY_DIR}/system/systemd/tmpfiles/netdata.conf
+                COMPONENT netdata
+                DESTINATION usr/lib/tmpfiles.d)
         install(DIRECTORY
                 COMPONENT netdata
                 DESTINATION usr/lib/systemd/journald@netdata.conf.d)

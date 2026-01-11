@@ -532,7 +532,12 @@ int journalfile_destroy_unsafe(struct rrdengine_journalfile *journalfile, struct
     if (journalfile->file)
         (void)close_uv_file(datafile, journalfile->file);
 
-    // This is the new journal v2 index file
+    // Wait for all references to be released and unmap before deleting files.
+    // This prevents SIGBUS when threads are still accessing the mmap'd data.
+    if(journalfile_v2_data_available(journalfile))
+        journalfile_v2_data_unmap_permanently(journalfile);
+
+    // Now safe to delete the files - no threads are accessing them
     int deleted = 0;
     UNLINK_FILE(ctx, path_v2, ret);
     if (ret == 0)
@@ -543,9 +548,6 @@ int journalfile_destroy_unsafe(struct rrdengine_journalfile *journalfile, struct
         deleted++;
 
     __atomic_add_fetch(&ctx->stats.journalfile_deletions, deleted, __ATOMIC_RELAXED);
-
-    if(journalfile_v2_data_available(journalfile))
-        journalfile_v2_data_unmap_permanently(journalfile);
 
     return ret;
 }
@@ -655,6 +657,7 @@ static void journalfile_restore_extent_metadata(struct rrdengine_instance *ctx, 
 
     time_t now_s = max_acceptable_collected_time();
     time_t extent_first_time_s = journalfile->v2.first_time_s ? journalfile->v2.first_time_s : LONG_MAX;
+    time_t extent_last_time_s = journalfile->v2.last_time_s ? journalfile->v2.last_time_s : 0;
     for (i = 0; i < count ; ++i) {
         nd_uuid_t *temp_id;
         uint8_t page_type = jf_metric_data->descr[i].type;
@@ -719,11 +722,13 @@ static void journalfile_restore_extent_metadata(struct rrdengine_instance *ctx, 
             jf_metric_data->extent_size);
 
         extent_first_time_s = MIN(extent_first_time_s, vd.start_time_s);
+        extent_last_time_s = MAX(extent_last_time_s, vd.end_time_s);
 
         mrg_metric_release(main_mrg, metric);
     }
 
     journalfile->v2.first_time_s = extent_first_time_s;
+    journalfile->v2.last_time_s = extent_last_time_s;
 
     time_t old = __atomic_load_n(&ctx->atomic.first_time_s, __ATOMIC_RELAXED);;
     do {
@@ -828,7 +833,7 @@ static uint64_t journalfile_iterate_transactions(struct rrdengine_instance *ctx,
 
             max_size = pos + size_bytes - pos_i;
             ret = journalfile_replay_transaction(ctx, journalfile, buf + pos_i, &id, max_size);
-            if (!ret) /* TODO: support transactions bigger than 4K */
+            if (!ret)
                 /* unknown transaction size, move on to the next block */
                 pos_i = ALIGN_BYTES_FLOOR(pos_i + RRDENG_BLOCK_SIZE);
             else
@@ -1008,6 +1013,8 @@ void journalfile_v2_populate_retention_to_mrg(struct rrdengine_instance *ctx, st
     time_t global_first_time_s;
     bool failed = false;
     uint32_t entries;
+    // Calculate number of samples here and update once the file is loaded
+    uint64_t journal_samples = 0;
     PROTECTED_ACCESS_SETUP(data_start, journalfile->mmap.size, path_v2, "mrg-load");
     if(no_signal_received) {
         entries = j2_header->metric_count;
@@ -1020,7 +1027,14 @@ void journalfile_v2_populate_retention_to_mrg(struct rrdengine_instance *ctx, st
             time_t end_time_s = header_start_time_s + metric->delta_end_s;
 
             mrg_update_metric_retention_and_granularity_by_uuid(
-                main_mrg, (Word_t)ctx, &metric->uuid, start_time_s, end_time_s, metric->update_every_s, now_s);
+                main_mrg,
+                (Word_t)ctx,
+                &metric->uuid,
+                start_time_s,
+                end_time_s,
+                metric->update_every_s,
+                now_s,
+                &journal_samples);
 
             metric++;
         }
@@ -1031,6 +1045,8 @@ void journalfile_v2_populate_retention_to_mrg(struct rrdengine_instance *ctx, st
 
     if (unlikely(failed))
         return;
+
+    __atomic_add_fetch(&ctx->atomic.samples, journal_samples, __ATOMIC_RELAXED);
 
     usec_t ended_ut = now_monotonic_usec();
 
@@ -1299,6 +1315,10 @@ bool journalfile_migrate_to_v2_callback(Word_t section, unsigned datafile_fileno
                                         Pvoid_t JudyL_metrics, Pvoid_t JudyL_extents_pos,
                                         size_t number_of_extents, size_t number_of_metrics, size_t number_of_pages, void *user_data)
 {
+    // Nothing to migrate if no metrics
+    if (number_of_metrics == 0)
+        return true;
+
     char path[RRDENG_PATH_MAX];
     Pvoid_t *PValue;
     struct rrdengine_instance *ctx = (struct rrdengine_instance *) section;
@@ -1587,7 +1607,11 @@ int journalfile_load(struct rrdengine_instance *ctx, struct rrdengine_journalfil
     nd_log_daemon(NDLP_DEBUG, "DBENGINE: journal file \"%s\" loaded (size:%" PRIu64 ").", path, file_size);
 
     bool is_last_file = (ctx_last_fileno_get(ctx) == journalfile->datafile->fileno);
-    if (is_last_file && journalfile->datafile->pos <= rrdeng_target_data_file_size(ctx) / 3) {
+    bool has_old_data = false;
+    if (ctx->config.tier == 0 && journalfile->v2.last_time_s > 0)
+        has_old_data = (now_realtime_sec() - journalfile->v2.last_time_s) > 86400;
+
+    if (is_last_file && journalfile->datafile->pos <= rrdeng_target_data_file_size(ctx) / 3 && !has_old_data) {
         ctx->loading.create_new_datafile_pair = false;
         return 0;
     }

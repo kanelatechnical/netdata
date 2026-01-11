@@ -266,18 +266,11 @@ void nd_thread_join_threads()
     ND_THREAD *nti;
     do {
         spinlock_lock(&threads_globals.exited.spinlock);
-
         nti = threads_globals.exited.list;
-
-        if (nti) {
-            DOUBLE_LINKED_LIST_REMOVE_ITEM_UNSAFE(threads_globals.exited.list, nti, prev, next);
-            nti->list = ND_THREAD_LIST_NONE;
-            nd_log_daemon(NDLP_DEBUG, "nd_thread_join_threads: Joining thread with id %d (%s) during shutdown", nti->tid, nti->tag);
-        }
-
         spinlock_unlock(&threads_globals.exited.spinlock);
 
-        // handles null
+        // nd_thread_join() handles NULL and will remove from list and free atomically
+        // to avoid race with other callers joining the same thread
         nd_thread_join(nti);
 
     } while (nti);
@@ -458,37 +451,68 @@ int nd_thread_join(ND_THREAD *nti) {
     if(!nti)
         return ESRCH;
 
-    if(nd_thread_status_check(nti, NETDATA_THREAD_STATUS_JOINED))
-        return 0;
+    // Atomically check and set JOINED flag to prevent race conditions
+    // where two threads both try to join the same thread
+    NETDATA_THREAD_OPTIONS old_options;
+    do {
+        old_options = __atomic_load_n(&nti->options, __ATOMIC_ACQUIRE);
+        if(old_options & NETDATA_THREAD_STATUS_JOINED)
+            return 0;
+    } while(!__atomic_compare_exchange_n(&nti->options, &old_options,
+                                          old_options | NETDATA_THREAD_STATUS_JOINED,
+                                          false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
 
     int ret;
+
     if((ret = uv_thread_join(&nti->thread))) {
         // we can't join the thread
 
         nd_log(NDLS_DAEMON, NDLP_WARNING,
                "cannot join thread. uv_thread_join() failed with code %d. (tag=%s)",
                ret, nti->tag);
-    }
-    else {
-        // we successfully joined the thread
-       nd_thread_status_set(nti, NETDATA_THREAD_STATUS_JOINED);
 
-        spinlock_lock(&threads_globals.running.spinlock);
-        if(nti->list == ND_THREAD_LIST_RUNNING) {
-            DOUBLE_LINKED_LIST_REMOVE_ITEM_UNSAFE(threads_globals.running.list, nti, prev, next);
-            nti->list = ND_THREAD_LIST_NONE;
+        // On Windows/MSYS2, if the thread exited very quickly, uv_thread_join() can fail with EINVAL (-22)
+        // because the thread handle becomes invalid before the join executes. However, the thread may
+        // still be finishing its cleanup. Wait for it to reach FINISHED state before cleaning up.
+        if(ret == -22) { // UV_EINVAL
+            nd_log(NDLS_DAEMON, NDLP_INFO,
+                   "thread '%s' join returned EINVAL, waiting for thread to finish...", nti->tag);
+
+            // Spin-wait for the thread to mark itself as finished
+            size_t retries = 0;
+            while(!nd_thread_status_check(nti, NETDATA_THREAD_STATUS_FINISHED) && retries < 1000) {
+                sleep_usec(1 * USEC_PER_MS); // 1ms
+                retries++;
+            }
+
+            if (nd_thread_status_check(nti, NETDATA_THREAD_STATUS_FINISHED)) {
+                nd_log(NDLS_DAEMON, NDLP_INFO, "thread '%s' confirmed finished, cleaning up structure", nti->tag);
+                ret = 0;
+            } else {
+                nd_log(NDLS_DAEMON, NDLP_ERR, "thread '%s' did not reach FINISHED state after 1 second", nti->tag);
+            }
         }
-        spinlock_unlock(&threads_globals.running.spinlock);
-
-        spinlock_lock(&threads_globals.exited.spinlock);
-        if(nti->list == ND_THREAD_LIST_EXITED) {
-            DOUBLE_LINKED_LIST_REMOVE_ITEM_UNSAFE(threads_globals.exited.list, nti, prev, next);
-            nti->list = ND_THREAD_LIST_NONE;
-        }
-        spinlock_unlock(&threads_globals.exited.spinlock);
-
-        freez(nti);
     }
+
+    // Always clean up the thread structure - if uv_thread_join() failed,
+    // retrying won't help (thread doesn't exist, not joinable, or logic error)
+    // JOINED flag was already set atomically at the start of this function
+
+    spinlock_lock(&threads_globals.running.spinlock);
+    if(nti->list == ND_THREAD_LIST_RUNNING) {
+        DOUBLE_LINKED_LIST_REMOVE_ITEM_UNSAFE(threads_globals.running.list, nti, prev, next);
+        nti->list = ND_THREAD_LIST_NONE;
+    }
+    spinlock_unlock(&threads_globals.running.spinlock);
+
+    spinlock_lock(&threads_globals.exited.spinlock);
+    if(nti->list == ND_THREAD_LIST_EXITED) {
+        DOUBLE_LINKED_LIST_REMOVE_ITEM_UNSAFE(threads_globals.exited.list, nti, prev, next);
+        nti->list = ND_THREAD_LIST_NONE;
+    }
+    spinlock_unlock(&threads_globals.exited.spinlock);
+
+    freez(nti);
 
     return ret;
 }

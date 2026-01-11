@@ -555,6 +555,8 @@ void sql_check_removed_alerts_state(RRDHOST *host)
 
            sql_inject_removed_status(host, alarm_id, alarm_event_id, unique_id, ++max_unique_id, &transition_id);
         }
+        if (!service_running(SERVICE_HEALTH))
+            break;
     }
 done:
     REPORT_BIND_FAIL(res, param);
@@ -1111,7 +1113,7 @@ void sql_health_alarm_log2json(RRDHOST *host, BUFFER *wb, time_t after, const ch
         if (sqlite3_column_type(stmt_query, 24) == SQLITE_NULL)
             buffer_json_member_add_string(wb, "old_value", NULL);
         else
-            buffer_json_member_add_double(wb, "old_value", sqlite3_column_double(stmt_query, 23));
+            buffer_json_member_add_double(wb, "old_value", sqlite3_column_double(stmt_query, 24));
 
         freez(edit_command);
 

@@ -274,9 +274,9 @@ func TestScalarCollector_Collect(t *testing.T) {
 								OID:  "1.3.6.1.2.1.1.3.0",
 								Name: "sysUpTime",
 							},
-							StaticTags: []string{
-								"source:system",
-								"type:uptime",
+							StaticTags: []ddprofiledefinition.StaticMetricTagConfig{
+								{Tag: "source", Value: "system"},
+								{Tag: "type", Value: "uptime"},
 							},
 						},
 					},
@@ -709,7 +709,8 @@ func TestScalarCollector_Collect(t *testing.T) {
 			missingOIDs := make(map[string]bool)
 			collector := newScalarCollector(mockHandler, missingOIDs, logger.New())
 
-			result, err := collector.Collect(tc.profile)
+			var stats ddsnmp.CollectionStats
+			result, err := collector.collect(tc.profile, &stats)
 
 			if tc.expectedError {
 				assert.Error(t, err)

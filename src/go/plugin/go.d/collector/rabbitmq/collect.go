@@ -9,7 +9,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/web"
+	"github.com/netdata/netdata/go/plugins/pkg/web"
 )
 
 func (c *Collector) collect() (map[string]int64, error) {
@@ -81,10 +81,6 @@ func (c *Collector) getClusterMeta() (id string, name string, err error) {
 
 	if err := c.webClient().RequestJSON(req, &resp); err != nil {
 		return "", "", err
-	}
-
-	if resp.RabbitmqVersion == "" {
-		return "", "", fmt.Errorf("unexpected response: rabbitmq version is empty")
 	}
 
 	id = "unknown"

@@ -2,6 +2,7 @@
 
 #include "apps_plugin.h"
 #include "libnetdata/required_dummies.h"
+#include "libnetdata/parsers/duration.h"
 
 #define APPS_PLUGIN_FUNCTIONS() do { \
     fprintf(stdout, PLUGINSD_KEYWORD_FUNCTION " \"processes\" %d \"%s\" \"top\" "HTTP_ACCESS_FORMAT" %d\n",         \
@@ -379,6 +380,9 @@ cleanup:
 
 static bool profile_speed = false;
 static bool print_tree_and_exit = false;
+#if (PROCESSES_HAVE_SMAPS_ROLLUP == 1)
+int pss_refresh_period = 0; // disabled by default
+#endif
 
 static void parse_args(int argc, char **argv)
 {
@@ -438,6 +442,30 @@ static void parse_args(int argc, char **argv)
             if(max_fds_cache_seconds < 0) max_fds_cache_seconds = 0;
             continue;
         }
+
+#if (PROCESSES_HAVE_SMAPS_ROLLUP == 1)
+        if(strcmp("--pss", argv[i]) == 0) {
+            if(argc <= i + 1) {
+                fprintf(stderr, "Parameter '--pss' requires a duration (e.g. 5m, 300s) or 'off'.\n");
+                exit(1);
+            }
+            i++;
+            int64_t seconds = 0;
+            if(!duration_parse(argv[i], &seconds, "s", "s")) {
+                fprintf(stderr, "Cannot parse '--pss' value '%s'.\n", argv[i]);
+                exit(1);
+            }
+            if(seconds <= 0) {
+                pss_refresh_period = 0; // disabled
+            }
+            else {
+                pss_refresh_period = (int)seconds;
+                if(pss_refresh_period < 1)
+                    pss_refresh_period = 1;
+            }
+            continue;
+        }
+#endif
 #endif
 
 #if (PROCESSES_HAVE_CPU_CHILDREN_TIME == 1) || (PROCESSES_HAVE_CHILDREN_FLTS == 1)
@@ -557,6 +585,12 @@ static void parse_args(int argc, char **argv)
                     "                        max given)\n"
                     "                        (default is %d seconds)\n"
                     "\n"
+#if (PROCESSES_HAVE_SMAPS_ROLLUP == 1)
+                    " --pss TIME            enable estimated memory using PSS sampling at the given interval\n"
+                    "                        (e.g. 5m, 300s). Use 'off' or '0' to disable.\n"
+                    "                        (default is off)\n"
+                    "\n"
+#endif
 #endif
                     " version or -v or -V print program version and exit\n"
                     "\n"
@@ -750,12 +784,13 @@ int main(int argc, char **argv) {
 
     apps_pids_init();
     OS_FUNCTION(apps_os_init)();
+    int exit_status = 0;
 
     // ------------------------------------------------------------------------
     // the event loop for functions
 
     struct functions_evloop_globals *wg =
-            functions_evloop_init(1, "APPS", &apps_and_stdout_mutex, &apps_plugin_exit);
+        functions_evloop_init(1, "APPS", &apps_and_stdout_mutex, &apps_plugin_exit, &exit_status);
 
     functions_evloop_add_function(wg, "processes", function_processes, PLUGINS_FUNCTIONS_TIMEOUT_DEFAULT, NULL);
 
@@ -767,7 +802,7 @@ int main(int argc, char **argv) {
     global_iterations_counter = 1;
     heartbeat_t hb;
     heartbeat_init(&hb, update_every * USEC_PER_SEC);
-    for(; !apps_plugin_exit ; global_iterations_counter++) {
+    for (; !__atomic_load_n(&apps_plugin_exit, __ATOMIC_ACQUIRE); global_iterations_counter++) {
         netdata_mutex_unlock(&apps_and_stdout_mutex);
 
         usec_t dt;
@@ -847,4 +882,5 @@ int main(int argc, char **argv) {
         debug_log("done Loop No %zu", global_iterations_counter);
     }
     netdata_mutex_unlock(&apps_and_stdout_mutex);
+    exit(exit_status);
 }

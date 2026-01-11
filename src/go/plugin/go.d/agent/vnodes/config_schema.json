@@ -28,10 +28,7 @@
     },
     "required": [
       "guid"
-    ],
-    "patternProperties": {
-      "^name$": {}
-    }
+    ]
   },
   "uiSchema": {
     "uiOptions": {

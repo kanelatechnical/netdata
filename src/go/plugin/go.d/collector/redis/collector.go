@@ -10,19 +10,25 @@ import (
 	"sync"
 	"time"
 
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/module"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/confopt"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/metrix"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/tlscfg"
-
 	"github.com/blang/semver/v4"
 	"github.com/redis/go-redis/v9"
+
+	"github.com/netdata/netdata/go/plugins/pkg/confopt"
+	"github.com/netdata/netdata/go/plugins/pkg/tlscfg"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/module"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/metrix"
 )
 
 //go:embed "config_schema.json"
 var configSchema string
 
+type noopLogger struct{}
+
+func (noopLogger) Printf(context.Context, string, ...any) {}
+
 func init() {
+	redis.SetLogger(noopLogger{})
+
 	module.Register("redis", module.Creator{
 		JobConfigSchema: configSchema,
 		Create:          func() module.Module { return New() },

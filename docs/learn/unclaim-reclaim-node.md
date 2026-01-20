@@ -118,4 +118,4 @@ After reclaiming, verify the node appears in:
 ## Related Documentation
 
 - [Remove a node from Netdata Cloud entirely](/docs/learn/remove-node.md) - For permanent node removal
-- [Connect Agent to Cloud](https://github.com/netdata/netdata/blob/master/src/claim/README.md) - Initial connection setup
+- [Connect Agent to Cloud](/src/claim/README.md) - Initial connection setup
